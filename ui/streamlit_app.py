@@ -1,54 +1,71 @@
 import streamlit as st
+import os
+import io
 import requests
 from typing import Optional
-import io
 
+# -----------------------------
+# Deployment detection
+# -----------------------------
+DEPLOYED = os.getenv("STREAMLIT_SERVER_HEADLESS") == "true"
+
+# -----------------------------
+# Optional dependencies
+# -----------------------------
 try:
     from streamlit_js_eval import streamlit_js_eval
 except ImportError:
-    st.error("streamlit-js-eval is required for link redirection. Install it with: pip install streamlit-js-eval")
     streamlit_js_eval = None
 
 try:
     from PyPDF2 import PdfReader
 except ImportError:
-    st.error("PyPDF2 is required for PDF uploads. Install it with: pip install PyPDF2")
     PdfReader = None
 
+# -----------------------------
+# Backend imports (ONLY used when deployed)
+# -----------------------------
+if DEPLOYED:
+    from crew.agents.resume_agent import ResumeAgent
+    from crew.agents.job_discovery import JobDiscoveryAgent
+    from crew.agents.matcher_agent import MatcherAgent
+    from crew.agents.outreach_agent import OutreachAgent
+    from crew.agents.tracker_agent import TrackerAgent
+    from storage.db import init_db
 
 # -----------------------------
 # Constants
 # -----------------------------
-API_BASE_URL = "http://127.0.0.1:8000"  # Assuming backend runs locally
+API_BASE_URL = "http://127.0.0.1:8000"  # Local dev only
 
 
 # -----------------------------
 # Helper Functions
 # -----------------------------
 def extract_text_from_file(uploaded_file):
-    """
-    Extract text from uploaded file (TXT or PDF).
-    """
     if uploaded_file is None:
         return ""
-    
-    file_type = uploaded_file.type
-    if file_type == "text/plain":
+
+    if uploaded_file.type == "text/plain":
         return uploaded_file.read().decode("utf-8")
-    elif file_type == "application/pdf" and PdfReader:
+
+    if uploaded_file.type == "application/pdf" and PdfReader:
         pdf_reader = PdfReader(io.BytesIO(uploaded_file.read()))
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-        return text
-    else:
-        st.error("Unsupported file type. Please upload a TXT or PDF file.")
-        return ""
+        return "\n".join(page.extract_text() or "" for page in pdf_reader.pages)
+
+    st.error("Unsupported file type. Upload TXT or PDF.")
+    return ""
 
 
-def run_pipeline(resume_text: str, query: str, location: Optional[str], max_results: int, min_score: int):
+def run_pipeline_backend(
+    resume_text: str,
+    query: str,
+    location: Optional[str],
+    max_results: int,
+    min_score: int,
+):
     """
-    Call the FastAPI backend to run the job search pipeline.
+    Local development → call FastAPI backend
     """
     payload = {
         "resume_text": resume_text,
@@ -57,124 +74,152 @@ def run_pipeline(resume_text: str, query: str, location: Optional[str], max_resu
         "max_results": max_results,
         "min_score": min_score,
     }
-    try:
-        # Increased timeout to 120 seconds for LLM processing
-        response = requests.post(f"{API_BASE_URL}/run-pipeline", json=payload, timeout=120)
-        response.raise_for_status()
-        return response.json()
-    except requests.Timeout:
-        st.error("Request timed out. The job search may be taking longer due to high demand. Try again or reduce 'Max Results'.")
-        return None
-    except requests.RequestException as e:
-        st.error(f"Error connecting to backend: {str(e)}. Ensure the FastAPI server is running on {API_BASE_URL}.")
-        return None
+
+    response = requests.post(
+        f"{API_BASE_URL}/run-pipeline",
+        json=payload,
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def run_pipeline_inline(
+    resume_text: str,
+    query: str,
+    location: Optional[str],
+    max_results: int,
+    min_score: int,
+):
+    """
+    Streamlit Cloud → run pipeline in-process
+    """
+    init_db()
+
+    resume_agent = ResumeAgent()
+    job_agent = JobDiscoveryAgent()
+    matcher_agent = MatcherAgent()
+    outreach_agent = OutreachAgent()
+    tracker_agent = TrackerAgent()
+
+    resume = resume_agent.parse(resume_text)
+    jobs = job_agent.discover(query=query, location=location, max_results=max_results)
+    scored = matcher_agent.score(resume, jobs)
+
+    results = []
+
+    for job, score in scored:
+        if score < min_score:
+            continue
+
+        try:
+            message = outreach_agent.generate_message(resume, job, score)
+        except Exception:
+            message = ""
+
+        try:
+            tracker_agent.track(
+                job_id=job.job_id,
+                job_title=job.title,
+                company=job.company,
+                fit_score=score,
+                outreach_message=message,
+            )
+        except Exception:
+            pass
+
+        results.append(
+            {
+                "job_id": job.job_id,
+                "title": job.title,
+                "company": job.company,
+                "fit_score": score,
+                "outreach_message": message,
+                "url": job.url,
+            }
+        )
+
+    return {"results": results}
 
 
 # -----------------------------
-# Streamlit App
+# Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Multi-Agent Job Search", page_icon="🔍", layout="wide")
 
 st.title("🔍 Multi-Agent Job Search System")
-st.markdown("""
-Welcome to the AI-powered job search assistant! Upload your resume or paste text, specify your search criteria, and let our multi-agent system discover, match, and generate outreach messages for relevant jobs.
 
-**Features:**
-- Resume parsing and analysis
-- Job discovery via search engines
-- Fit scoring with AI
-- Personalized outreach message generation
-- Application tracking
+st.markdown(
+    """
+AI-powered job search assistant with transparent reasoning and personalized outreach.
 
-Ensure the backend server is running before proceeding.
-""")
+**Note:**  
+- Local dev uses a FastAPI backend  
+- Deployed version runs the pipeline in-process due to platform constraints
+"""
+)
 
-# Sidebar for inputs
+# -----------------------------
+# Sidebar inputs
+# -----------------------------
 st.sidebar.header("Search Parameters")
 
-# Resume input: File uploader or text area
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Resume (TXT or PDF)",
-    type=["txt", "pdf"],
-    help="Upload your resume file for automatic text extraction."
+uploaded_file = st.sidebar.file_uploader("Upload Resume (TXT or PDF)", type=["txt", "pdf"])
+
+resume_text = (
+    extract_text_from_file(uploaded_file)
+    if uploaded_file
+    else st.sidebar.text_area("Or paste resume text", height=200)
 )
 
-resume_text = ""
-if uploaded_file:
-    resume_text = extract_text_from_file(uploaded_file)
-    st.sidebar.success("Resume uploaded and processed!")
-else:
-    resume_text = st.sidebar.text_area(
-        "Or Paste Resume Text",
-        height=200,
-        placeholder="Paste your resume here...",
-        help="Enter your full resume text for analysis."
-    )
+query = st.sidebar.text_input("Job Query", placeholder="e.g. machine learning intern")
+location = st.sidebar.text_input("Location (optional)", placeholder="e.g. India")
 
-query = st.sidebar.text_input(
-    "Job Query",
-    placeholder="e.g., machine learning intern",
-    help="Keywords for job search."
-)
+max_results = st.sidebar.slider("Max Results", 1, 10, 5)
+min_score = st.sidebar.slider("Minimum Fit Score", 0, 100, 50)
 
-location = st.sidebar.text_input(
-    "Location (Optional)",
-    placeholder="e.g., India",
-    help="City or country for location-based search."
-)
-
-max_results = st.sidebar.slider(
-    "Max Results",
-    min_value=1,
-    max_value=10,
-    value=5,
-    help="Maximum number of jobs to discover."
-)
-
-min_score = st.sidebar.slider(
-    "Minimum Fit Score",
-    min_value=0,
-    max_value=100,
-    value=50,
-    help="Only show jobs with fit score above this threshold."
-)
-
-# Run button
+# -----------------------------
+# Run pipeline
+# -----------------------------
 if st.sidebar.button("🚀 Run Job Search", type="primary"):
     if not resume_text.strip():
-        st.error("Please provide resume text via upload or paste.")
+        st.error("Please provide resume text.")
     elif not query.strip():
         st.error("Please provide a job query.")
     else:
-        with st.spinner("Running job search pipeline... This may take a moment."):
-            result = run_pipeline(resume_text, query, location or None, max_results, min_score)
-        
+        with st.spinner("Running job search pipeline..."):
+            try:
+                if DEPLOYED:
+                    result = run_pipeline_inline(
+                        resume_text, query, location or None, max_results, min_score
+                    )
+                else:
+                    result = run_pipeline_backend(
+                        resume_text, query, location or None, max_results, min_score
+                    )
+            except Exception as e:
+                st.error(f"Pipeline failed: {e}")
+                result = None
+
         if result:
             results = result.get("results", [])
             if not results:
-                st.warning("No jobs found matching your criteria. Try adjusting the parameters.")
+                st.warning("No matching jobs found.")
             else:
-                st.success(f"Found {len(results)} matching job(s)!")
-                
+                st.success(f"Found {len(results)} matching job(s)")
                 for i, job in enumerate(results, 1):
-                    with st.container():
-                        st.subheader(f"{i}. {job['title']} @ {job['company']}")
-                        st.write(f"**Fit Score:** {job['fit_score']}/100")
-                        if job.get('url'):
-                            # Display URL for debugging
-                            st.write(f"**Job URL:** {job['url']}")
-                            # Fallback: Clickable Markdown link (opens in same tab)
-                            st.markdown(f"[Apply for {job['title']}]({job['url']})", unsafe_allow_html=False)
-                            # Optional: Button with JS (if installed)
-                            if streamlit_js_eval:
-                                if st.button(f"Open in New Tab", key=f"apply_{i}"):
-                                    streamlit_js_eval(js_expressions=f"window.open('{job['url']}', '_blank')")
-                        
-                        st.markdown("**Outreach Message:** (Copy and paste as needed)")
-                        # Use st.code for easy copying
-                        st.code(job['outreach_message'], language=None)
-                        st.divider()
+                    st.subheader(f"{i}. {job['title']} @ {job['company']}")
+                    st.write(f"**Fit Score:** {job['fit_score']}/100")
 
+                    if job.get("url"):
+                        st.markdown(f"[Apply here]({job['url']})")
+
+                    st.markdown("**Outreach Message**")
+                    st.code(job["outreach_message"])
+                    st.divider()
+
+# -----------------------------
 # Footer
+# -----------------------------
 st.markdown("---")
-st.markdown("Built with ❤️ using Streamlit and FastAPI. Ensure API keys are configured for full functionality.")
+st.markdown("Built with ❤️ using Streamlit and FastAPI")
