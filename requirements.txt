@@ -54,3 +54,4 @@ loguru>=0.7.0
 pydantic-settings>=2.0.0
 streamlit-js-eval
 PyPDF2
+sentence-transformers
