@@ -73,6 +73,19 @@ The system evolved iteratively:
 
 ---
 
+## 🧩 What Makes This Different
+
+Unlike traditional job portals (e.g. LinkedIn or Indeed), this system is **candidate-centric and decision-transparent**.
+
+Instead of opaque recommendations, it exposes the *entire reasoning pipeline* behind each job match:
+- how the resume was interpreted
+- why a job scored the way it did
+- which resume elements influenced the decision
+- how changing thresholds or intent alters outcomes
+
+This makes the job search process **inspectable, controllable, and intent-driven**, allowing users to reason *with* the system rather than passively consume recommendations.
+
+
 ## 🚀 Installation
 
 ### 1. Clone the repository
